@@ -7,7 +7,6 @@ from PyQt6 import QtCore
 
 STATUS_TIMEOUT = 0.01
 
-
 def openSerial(port, baud):
     serialport = serial.serial_for_url(port, do_not_open=True)
     serialport.baudrate = baud
@@ -16,7 +15,8 @@ def openSerial(port, baud):
     serialport.bytesize = serial.EIGHTBITS
     serialport.dsrdtr = True
     serialport.dtr = True
-    
+    #serialport.timeout = 1
+    #serialport.write_timeout = 1
     try:
         serialport.open()
     except serial.SerialException as e:
@@ -53,7 +53,7 @@ class SerialInterface(QtCore.QObject):
         self.m_state = None
         self.m_pos = None
         self.startReadThread()
-        self.startStatusThread()
+        #self.startStatusThread()
 
     @QtCore.pyqtProperty(str, notify=stateChanged)
     def state(self):
@@ -87,6 +87,7 @@ class SerialInterface(QtCore.QObject):
 
     def read(self):
         while True:
+            print("read thread waiting for")
             self.readline()
 
     def readline(self):
@@ -131,7 +132,10 @@ class SerialInterface(QtCore.QObject):
 
     def write(self, data):
         print("write", data)
-        self.serialport.write(bytes(data, "utf-8"))
+        b = bytes(data.strip(), "utf-8")
+        print("write", b)
+        self.serialport.write(b)
+        self.serialport.write(b"\\r\\n")
         print("write done")
-        self.serialport.flush()
-        print("flush done")
+        #self.serialport.flush()
+        #print("flush done")

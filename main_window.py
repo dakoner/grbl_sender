@@ -7,7 +7,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__(*args, **kwargs)
         loadUi("grbl_sender.ui", self)
  
-        self.serial = serial_interface_qobject.SerialInterface('/dev/ttyUSB0')
+        self.serial = serial_interface_qobject.SerialInterface('COM6')
         self.serial.posChanged.connect(self.onPosChange)
         self.serial.stateChanged.connect(self.onStateChange)
         self.serial.messageChanged.connect(self.onMessageChanged)
