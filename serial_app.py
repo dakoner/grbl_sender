@@ -240,6 +240,7 @@ class SerialConsoleApp(QMainWindow):
         self.is_polling_status = False
         self.waiting_for_status_response = False
         self.received_data_buffer = ""
+        self.is_laser_on = False
 
         # --- Connect Signals to Slots ---
         self.connect_button.clicked.connect(self.toggle_connection)
@@ -248,6 +249,7 @@ class SerialConsoleApp(QMainWindow):
         self.soft_reset_button.clicked.connect(self.soft_reset)
         self.abort_button.clicked.connect(self.send_abort)
         self.unlock_button.clicked.connect(self.send_unlock)
+        self.laser_toggle_button.clicked.connect(self.toggle_laser)
         self.send_file_button.clicked.connect(self.send_file)
         self.cancel_file_button.clicked.connect(self.cancel_file_transfer)
         self.jog_up_button.clicked.connect(lambda: self.send_jog_command("Y"))
@@ -292,6 +294,8 @@ class SerialConsoleApp(QMainWindow):
         self.soft_reset_button.setEnabled(self.is_connected and not is_transferring)
         self.abort_button.setEnabled(self.is_connected and not is_transferring)
         self.unlock_button.setEnabled(self.is_connected and not is_transferring)
+        self.laser_toggle_button.setEnabled(self.is_connected and not is_transferring)
+        self.laser_power_input.setEnabled(self.is_connected and not is_transferring)
         self.send_file_button.setEnabled(self.is_connected and not is_transferring)
         self.cancel_file_button.setEnabled(self.is_connected and is_transferring)
         
@@ -337,6 +341,10 @@ class SerialConsoleApp(QMainWindow):
 
     def disconnect_serial(self):
         """Closes the serial connection."""
+        # Safety feature: turn off laser on disconnect
+        if self.is_laser_on:
+            self.toggle_laser()
+
         if self.file_transfer_thread and self.file_transfer_thread.isRunning():
             self.cancel_file_transfer()
         
@@ -478,6 +486,28 @@ class SerialConsoleApp(QMainWindow):
         if self.is_connected:
             self.log_to_console("Sending unlock ($X)...")
             self.serial_port.write(b'$X\n')
+            
+    def toggle_laser(self):
+        """Toggles the laser on or off."""
+        if not self.is_connected:
+            return
+            
+        if self.is_laser_on:
+            # Turn laser off
+            command = "M5"
+            self.serial_port.write(command.encode('utf-8') + b'\n')
+            self.log_to_console(f">>> {command} (Laser Off)")
+            self.laser_toggle_button.setText("Laser On")
+            self.is_laser_on = False
+        else:
+            # Turn laser on
+            power = self.laser_power_input.value()
+            command = f"M3 S{power}"
+            self.serial_port.write(command.encode('utf-8') + b'\n')
+            self.log_to_console(f">>> {command} (Laser On)")
+            self.laser_toggle_button.setText("Laser Off")
+            self.is_laser_on = True
+
 
     def poll_status(self):
         """Sends '?' to poll device status."""
