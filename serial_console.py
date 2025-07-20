@@ -249,6 +249,7 @@ class SerialConsoleApp(QMainWindow):
         self.soft_reset_button.clicked.connect(self.soft_reset)
         self.abort_button.clicked.connect(self.send_abort)
         self.unlock_button.clicked.connect(self.send_unlock)
+        self.home_button.clicked.connect(self.send_home)
         self.laser_toggle_button.clicked.connect(self.toggle_laser)
         self.send_file_button.clicked.connect(self.send_file)
         self.cancel_file_button.clicked.connect(self.cancel_file_transfer)
@@ -294,6 +295,7 @@ class SerialConsoleApp(QMainWindow):
         self.soft_reset_button.setEnabled(self.is_connected and not is_transferring)
         self.abort_button.setEnabled(self.is_connected and not is_transferring)
         self.unlock_button.setEnabled(self.is_connected and not is_transferring)
+        self.home_button.setEnabled(self.is_connected and not is_transferring)
         self.laser_toggle_button.setEnabled(self.is_connected and not is_transferring)
         self.laser_power_input.setEnabled(self.is_connected and not is_transferring)
         self.send_file_button.setEnabled(self.is_connected and not is_transferring)
@@ -399,7 +401,7 @@ class SerialConsoleApp(QMainWindow):
         self.log_to_console(f"<<< {line}")
 
     def parse_and_display_status(self, line):
-        """Parses a FluidNC status string and updates the UI."""
+        """Parses a FluidNC or Grbl status string and updates the UI."""
         # Don't update from machine status if we are sending a file
         is_transferring = self.file_transfer_thread is not None and self.file_transfer_thread.isRunning()
         if is_transferring:
@@ -415,12 +417,12 @@ class SerialConsoleApp(QMainWindow):
             if state_match:
                 state = state_match.group(1)
 
-            # Extract MPos
-            mpos_match = re.search(r"MPos:([-\d\.]+),([-\d\.]+),([-\d\.]+)", line)
-            if mpos_match:
-                x = mpos_match.group(1)
-                y = mpos_match.group(2)
-                z = mpos_match.group(3)
+            # Extract MPos or WPos
+            pos_match = re.search(r"(?:MPos|WPos):([-\d\.]+),([-\d\.]+),([-\d\.]+)", line)
+            if pos_match:
+                x = pos_match.group(1)
+                y = pos_match.group(2)
+                z = pos_match.group(3)
 
             self.state_display.setText(state)
             self.x_pos_display.setText(x)
@@ -486,6 +488,12 @@ class SerialConsoleApp(QMainWindow):
         if self.is_connected:
             self.log_to_console("Sending unlock ($X)...")
             self.serial_port.write(b'$X\n')
+            
+    def send_home(self):
+        if self.is_connected:
+            command = "$H"
+            self.serial_port.write(command.encode('utf-8') + b'\n')
+            self.log_to_console(f">>> {command} (Homing Cycle)")
             
     def toggle_laser(self):
         """Toggles the laser on or off."""
