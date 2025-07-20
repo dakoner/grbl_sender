@@ -3,45 +3,14 @@ import time
 import threading
 import re
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QComboBox, QLabel, QGridLayout,
-    QFileDialog, QSpinBox, QMessageBox
+    QApplication, QMainWindow, QWidget,
+    QFileDialog, QLineEdit
 )
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt, pyqtSlot
-from PyQt6.QtGui import QFont, QKeyEvent
+from PyQt6.QtGui import QKeyEvent
+from PyQt6 import uic
 import serial
 import serial.tools.list_ports
-
-# --- Custom QLineEdit with Command History ---
-class CommandHistoryLineEdit(QLineEdit):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.history = []
-        self.history_index = -1
-
-    def add_to_history(self, command):
-        """Adds a command to the history, avoiding duplicates."""
-        if command in self.history:
-            self.history.remove(command)
-        self.history.insert(0, command)
-        self.history_index = -1 # Reset index
-
-    def keyPressEvent(self, event: QKeyEvent):
-        """Handle up and down arrow keys for history navigation."""
-        if event.key() == Qt.Key.Key_Up:
-            if self.history_index < len(self.history) - 1:
-                self.history_index += 1
-                self.setText(self.history[self.history_index])
-        elif event.key() == Qt.Key.Key_Down:
-            if self.history_index > 0:
-                self.history_index -= 1
-                self.setText(self.history[self.history_index])
-            else:
-                self.history_index = -1
-                self.clear()
-        else:
-            super().keyPressEvent(event)
-
 
 # --- Worker for Non-Blocking File Transfer ---
 class FileSenderWorker(QObject):
@@ -203,6 +172,37 @@ class FileSenderWorker(QObject):
         self.finished_signal.emit("File transfer cancelled by user.")
 
 
+# --- Custom QLineEdit with Command History ---
+class CommandHistoryLineEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.history = []
+        self.history_index = -1
+
+    def add_to_history(self, command):
+        """Adds a command to the history, avoiding duplicates."""
+        if command in self.history:
+            self.history.remove(command)
+        self.history.insert(0, command)
+        self.history_index = -1 # Reset index
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle up and down arrow keys for history navigation."""
+        if event.key() == Qt.Key.Key_Up:
+            if self.history_index < len(self.history) - 1:
+                self.history_index += 1
+                self.setText(self.history[self.history_index])
+        elif event.key() == Qt.Key.Key_Down:
+            if self.history_index > 0:
+                self.history_index -= 1
+                self.setText(self.history[self.history_index])
+            else:
+                self.history_index = -1
+                self.clear()
+        else:
+            super().keyPressEvent(event)
+
+
 # --- Main Application Window ---
 class SerialConsoleApp(QMainWindow):
     ack_received_signal = pyqtSignal()
@@ -210,8 +210,27 @@ class SerialConsoleApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyQt6 Graphical Serial Console")
-        self.setGeometry(100, 100, 900, 700)
+        
+        # Load the UI from the .ui file
+        uic.loadUi('serial_console.ui', self)
+
+        # --- Replace the placeholder QLineEdit with our custom one ---
+        # This is a common pattern when using .ui files with custom widgets.
+        # 1. Get the properties and layout of the placeholder
+        original_command_input = self.command_input
+        layout = original_command_input.parent().layout()
+        
+        # 2. Create an instance of our custom widget
+        self.command_input = CommandHistoryLineEdit()
+        
+        # 3. Copy properties from the placeholder
+        self.command_input.setObjectName(original_command_input.objectName())
+        self.command_input.setPlaceholderText(original_command_input.placeholderText())
+        
+        # 4. Replace the placeholder in the layout
+        layout.replaceWidget(original_command_input, self.command_input)
+        original_command_input.deleteLater()
+
 
         # --- Serial Port State ---
         self.serial_port = serial.Serial()
@@ -222,8 +241,26 @@ class SerialConsoleApp(QMainWindow):
         self.waiting_for_status_response = False
         self.received_data_buffer = ""
 
-        # --- UI Setup ---
-        self.init_ui()
+        # --- Connect Signals to Slots ---
+        self.connect_button.clicked.connect(self.toggle_connection)
+        self.command_input.returnPressed.connect(self.send_command)
+        self.hard_reset_button.clicked.connect(self.hard_reset)
+        self.soft_reset_button.clicked.connect(self.soft_reset)
+        self.abort_button.clicked.connect(self.send_abort)
+        self.unlock_button.clicked.connect(self.send_unlock)
+        self.send_file_button.clicked.connect(self.send_file)
+        self.cancel_file_button.clicked.connect(self.cancel_file_transfer)
+        self.jog_up_button.clicked.connect(lambda: self.send_jog_command("Y"))
+        self.jog_down_button.clicked.connect(lambda: self.send_jog_command("Y-"))
+        self.jog_left_button.clicked.connect(lambda: self.send_jog_command("X-"))
+        self.jog_right_button.clicked.connect(lambda: self.send_jog_command("X"))
+        self.jog_z_up_button.clicked.connect(lambda: self.send_jog_command("Z"))
+        self.jog_z_down_button.clicked.connect(lambda: self.send_jog_command("Z-"))
+
+        # --- Initial UI State ---
+        self.populate_ports()
+        self.baud_selector.setCurrentText("115200")
+        self.update_ui_state()
 
         # --- Timers ---
         self.status_poll_timer = QTimer(self)
@@ -233,142 +270,6 @@ class SerialConsoleApp(QMainWindow):
         self.serial_read_timer = QTimer(self)
         self.serial_read_timer.timeout.connect(self.read_serial_data)
         self.serial_read_timer.start(20) # Check for new data every 20ms
-
-    def init_ui(self):
-        """Initialize all UI components."""
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-
-        # --- Left Panel (Console and Input) ---
-        left_panel_layout = QVBoxLayout()
-        self.console_output = QTextEdit()
-        self.console_output.setReadOnly(True)
-        self.console_output.setFont(QFont("Courier", 10))
-        
-        self.command_input = CommandHistoryLineEdit()
-        self.command_input.setPlaceholderText("Type command and press Enter...")
-        self.command_input.returnPressed.connect(self.send_command)
-
-        left_panel_layout.addWidget(self.console_output)
-        left_panel_layout.addWidget(self.command_input)
-
-        # --- Right Panel (Controls) ---
-        right_panel_layout = QVBoxLayout()
-
-        # Connection Box
-        connection_box = QGridLayout()
-        connection_box.addWidget(QLabel("Port:"), 0, 0)
-        self.port_selector = QComboBox()
-        self.populate_ports()
-        connection_box.addWidget(self.port_selector, 0, 1)
-
-        connection_box.addWidget(QLabel("Baud Rate:"), 1, 0)
-        self.baud_selector = QComboBox()
-        self.baud_selector.addItems(["9600", "57600", "115200", "230400", "460800", "921600"])
-        self.baud_selector.setCurrentText("115200")
-        connection_box.addWidget(self.baud_selector, 1, 1)
-
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(self.toggle_connection)
-        connection_box.addWidget(self.connect_button, 2, 0, 1, 2)
-
-        # Device Control Box
-        control_box = QGridLayout()
-        self.hard_reset_button = QPushButton("Hard Reset (DTR)")
-        self.hard_reset_button.clicked.connect(self.hard_reset)
-        self.soft_reset_button = QPushButton("Soft Reset (Ctrl+X)")
-        self.soft_reset_button.clicked.connect(self.soft_reset)
-        self.abort_button = QPushButton("Abort (0x85)")
-        self.abort_button.clicked.connect(self.send_abort)
-        self.unlock_button = QPushButton("Unlock ($X)")
-        self.unlock_button.clicked.connect(self.send_unlock)
-        
-        control_box.addWidget(self.hard_reset_button, 0, 0)
-        control_box.addWidget(self.soft_reset_button, 0, 1)
-        control_box.addWidget(self.abort_button, 1, 0)
-        control_box.addWidget(self.unlock_button, 1, 1)
-
-
-        # Status Box
-        status_box = QGridLayout()
-        self.state_display = QLineEdit()
-        self.state_display.setReadOnly(True)
-        self.x_pos_display = QLineEdit()
-        self.x_pos_display.setReadOnly(True)
-        self.y_pos_display = QLineEdit()
-        self.y_pos_display.setReadOnly(True)
-        self.z_pos_display = QLineEdit()
-        self.z_pos_display.setReadOnly(True)
-
-        status_box.addWidget(QLabel("State:"), 0, 0)
-        status_box.addWidget(self.state_display, 0, 1)
-        status_box.addWidget(QLabel("X:"), 1, 0)
-        status_box.addWidget(self.x_pos_display, 1, 1)
-        status_box.addWidget(QLabel("Y:"), 2, 0)
-        status_box.addWidget(self.y_pos_display, 2, 1)
-        status_box.addWidget(QLabel("Z:"), 3, 0)
-        status_box.addWidget(self.z_pos_display, 3, 1)
-
-
-        # File Transfer Box
-        file_box = QGridLayout()
-        self.send_file_button = QPushButton("Send File")
-        self.send_file_button.clicked.connect(self.send_file)
-        self.cancel_file_button = QPushButton("Cancel Transfer")
-        self.cancel_file_button.clicked.connect(self.cancel_file_transfer)
-        self.cancel_file_button.setEnabled(False)
-        
-        file_box.addWidget(self.send_file_button, 0, 0)
-        file_box.addWidget(self.cancel_file_button, 0, 1)
-        self.file_progress_label = QLabel("File transfer idle.")
-        file_box.addWidget(self.file_progress_label, 1, 0, 1, 2)
-
-        # Jogging Box
-        jog_box = QGridLayout()
-        self.jog_up_button = QPushButton("Y+")
-        self.jog_down_button = QPushButton("Y-")
-        self.jog_left_button = QPushButton("X-")
-        self.jog_right_button = QPushButton("X+")
-        
-        jog_box.addWidget(self.jog_up_button, 0, 1)
-        jog_box.addWidget(self.jog_left_button, 1, 0)
-        jog_box.addWidget(self.jog_right_button, 1, 2)
-        jog_box.addWidget(self.jog_down_button, 2, 1)
-        
-        jog_box.addWidget(QLabel("Dist:"), 3, 0)
-        self.jog_dist_input = QLineEdit("10.0")
-        jog_box.addWidget(self.jog_dist_input, 3, 1, 1, 2)
-        
-        jog_box.addWidget(QLabel("Feed:"), 4, 0)
-        self.jog_feed_rate_input = QLineEdit("1000")
-        jog_box.addWidget(self.jog_feed_rate_input, 4, 1, 1, 2)
-        
-        self.jog_up_button.clicked.connect(lambda: self.send_jog_command("Y"))
-        self.jog_down_button.clicked.connect(lambda: self.send_jog_command("Y-"))
-        self.jog_left_button.clicked.connect(lambda: self.send_jog_command("X-"))
-        self.jog_right_button.clicked.connect(lambda: self.send_jog_command("X"))
-
-
-        # Add all boxes to the right panel
-        right_panel_layout.addLayout(connection_box)
-        right_panel_layout.addSpacing(15)
-        right_panel_layout.addLayout(control_box)
-        right_panel_layout.addSpacing(15)
-        right_panel_layout.addLayout(status_box)
-        right_panel_layout.addSpacing(15)
-        right_panel_layout.addLayout(file_box)
-        right_panel_layout.addSpacing(15)
-        right_panel_layout.addWidget(QLabel("Jog Control"))
-        right_panel_layout.addLayout(jog_box)
-        right_panel_layout.addStretch()
-
-        # Add panels to main layout
-        main_layout.addLayout(left_panel_layout, 7) # 70% width
-        main_layout.addLayout(right_panel_layout, 3) # 30% width
-
-        # Initially disable controls that require a connection
-        self.update_ui_state()
 
     def populate_ports(self):
         """Fills the port selector with available serial ports."""
@@ -399,7 +300,10 @@ class SerialConsoleApp(QMainWindow):
         self.jog_down_button.setEnabled(self.is_connected and not is_transferring)
         self.jog_left_button.setEnabled(self.is_connected and not is_transferring)
         self.jog_right_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_dist_input.setEnabled(self.is_connected and not is_transferring)
+        self.jog_z_up_button.setEnabled(self.is_connected and not is_transferring)
+        self.jog_z_down_button.setEnabled(self.is_connected and not is_transferring)
+        self.jog_xy_dist_input.setEnabled(self.is_connected and not is_transferring)
+        self.jog_z_dist_input.setEnabled(self.is_connected and not is_transferring)
         self.jog_feed_rate_input.setEnabled(self.is_connected and not is_transferring)
 
     def toggle_connection(self):
@@ -652,14 +556,19 @@ class SerialConsoleApp(QMainWindow):
         if not self.is_connected:
             return
         
+        axis = axis_dir[0]
+        
         try:
-            dist = float(self.jog_dist_input.text())
+            if axis in ('X', 'Y'):
+                dist = float(self.jog_xy_dist_input.text())
+            else: # Z axis
+                dist = float(self.jog_z_dist_input.text())
+            
             feed_rate = int(self.jog_feed_rate_input.text())
         except ValueError:
             self.log_to_console("Invalid jog distance or feed rate.")
             return
 
-        axis = axis_dir[0]
         if len(axis_dir) > 1 and axis_dir[1] == '-':
             dist = -dist
         
@@ -680,6 +589,6 @@ class SerialConsoleApp(QMainWindow):
 # --- Application Entry Point ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    console = SerialConsoleApp()
-    console.show()
+    window = SerialConsoleApp()
+    window.show()
     sys.exit(app.exec())
