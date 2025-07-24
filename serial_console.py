@@ -1,632 +1,443 @@
+# main.py
 import sys
 import time
-import threading
 import re
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QFileDialog, QLineEdit
-)
-from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt, pyqtSlot
-from PyQt6.QtGui import QKeyEvent
-from PyQt6 import uic
 import serial
 import serial.tools.list_ports
+from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QVBoxLayout, QWidget
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.uic import loadUi
+import pyqtgraph.opengl as gl
+import numpy as np
 
-# --- Worker for Non-Blocking File Transfer ---
-class FileSenderWorker(QObject):
+class SerialWorker(QObject):
     """
-    Worker thread to handle sending a file in the background with a send-and-wait protocol.
-    This prevents the GUI from freezing during the transfer.
+    Worker thread for handling serial communication.
     """
-    progress_signal = pyqtSignal(int, int)  # current_line, total_lines
-    finished_signal = pyqtSignal(str)      # success/failure message
-    log_signal = pyqtSignal(str)           # for logging messages to the main console
-    position_update_signal = pyqtSignal(str, str, str) # x, y, z as formatted strings
+    received = pyqtSignal(str)
+    finished = pyqtSignal()
+    file_transfer_progress = pyqtSignal(int)
+    file_transfer_complete = pyqtSignal(bool, str) # Success, message
 
-    def __init__(self, serial_port, file_path, ack_timeout=60):
+    def __init__(self, port, baudrate):
         super().__init__()
-        self.serial_port = serial_port
-        self.file_path = file_path
-        self.ack_timeout_seconds = ack_timeout
-        self._is_running = True
-        self.lines_to_send = []
-        self.total_lines = 0
-        self.waiting_for_ack = False
-        self.ack_timer = None
-        self.lock = threading.RLock() # Use a re-entrant lock
+        self.port = port
+        self.baudrate = baudrate
+        self.serial_port = None
+        self.running = False
+        self.is_sending_file = False
+        self.file_content = []
+        self.file_line_index = 0
+        self.gcode_to_send = None
+        self.cancel_transfer = False
+        self.response_timer = QTimer()
+        self.response_timer.setSingleShot(True)
+        self.response_timer.timeout.connect(self.handle_timeout)
 
-        # G-code parser state
-        self.current_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
-        self.distance_mode = 'G90' # Absolute is the default
-
-    def run(self):
-        """Main execution method for the worker."""
+    def connect(self):
         try:
-            with open(self.file_path, 'r') as f:
-                self.lines_to_send = [line.strip() for line in f if line.strip() and not line.strip().startswith(';')]
-            
-            if not self.lines_to_send:
-                self.finished_signal.emit("File is empty or contains only comments. Nothing to send.")
-                return
+            self.serial_port = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.running = True
+            self.thread = QThread.create(self.read_from_port)
+            self.thread.start()
+            return True
+        except serial.SerialException as e:
+            return False
 
-            self.total_lines = len(self.lines_to_send)
-            self.log_signal.emit(f"Starting file transfer of '{self.file_path}' ({self.total_lines} lines).")
-            self.log_signal.emit(f"Using send-and-wait protocol. ACK Timeout: {self.ack_timeout_seconds}s")
+    def disconnect(self):
+        if self.serial_port and self.serial_port.is_open:
+            self.running = False
+            if self.thread:
+                self.thread.quit()
+                self.thread.wait()
+            self.serial_port.close()
+        self.finished.emit()
 
-            # Setup the acknowledgement timeout timer
-            self.ack_timer = QTimer()
-            self.ack_timer.setSingleShot(True)
-            self.ack_timer.timeout.connect(self.timeout_occurred)
-            
-            # Start sending the first line
-            self.send_next_line()
-
-        except Exception as e:
-            self.finished_signal.emit(f"Error starting file transfer: {e}")
-
-    def _parse_gcode_line(self, line):
-        """Parses a G-code line to update the virtual machine position."""
-        # Check for distance mode changes
-        if 'G90' in line:
-            self.distance_mode = 'G90'
-        if 'G91' in line:
-            self.distance_mode = 'G91'
-
-        # Check for G92 (Set Position)
-        if 'G92' in line:
-            x_match = re.search(r'X([-\d\.]+)', line)
-            y_match = re.search(r'Y([-\d\.]+)', line)
-            z_match = re.search(r'Z([-\d\.]+)', line)
-            if x_match: self.current_pos['x'] = float(x_match.group(1))
-            if y_match: self.current_pos['y'] = float(y_match.group(1))
-            if z_match: self.current_pos['z'] = float(z_match.group(1))
-            self.position_update_signal.emit(
-                f"{self.current_pos['x']:.3f}",
-                f"{self.current_pos['y']:.3f}",
-                f"{self.current_pos['z']:.3f}"
-            )
-            return # G92 is not a motion command
-
-        # Check for motion commands (G0, G1)
-        if re.search(r'G[01]\b', line):
-            x_match = re.search(r'X([-\d\.]+)', line)
-            y_match = re.search(r'Y([-\d\.]+)', line)
-            z_match = re.search(r'Z([-\d\.]+)', line)
-
-            if not (x_match or y_match or z_match):
-                return # No coordinates in this motion command
-
-            if self.distance_mode == 'G90': # Absolute
-                if x_match: self.current_pos['x'] = float(x_match.group(1))
-                if y_match: self.current_pos['y'] = float(y_match.group(1))
-                if z_match: self.current_pos['z'] = float(z_match.group(1))
-            else: # Relative (G91)
-                if x_match: self.current_pos['x'] += float(x_match.group(1))
-                if y_match: self.current_pos['y'] += float(y_match.group(1))
-                if z_match: self.current_pos['z'] += float(z_match.group(1))
-            
-            self.position_update_signal.emit(
-                f"{self.current_pos['x']:.3f}",
-                f"{self.current_pos['y']:.3f}",
-                f"{self.current_pos['z']:.3f}"
-            )
-
-    def send_next_line(self):
-        """Sends a single line if not waiting for an ACK."""
-        with self.lock:
-            if not self._is_running or self.waiting_for_ack:
-                return
-
-            if self.lines_to_send:
-                line = self.lines_to_send.pop(0)
+    def read_from_port(self):
+        while self.running:
+            if self.serial_port and self.serial_port.is_open:
                 try:
-                    # Parse the line for position updates BEFORE sending
-                    self._parse_gcode_line(line)
-                    
-                    self.serial_port.write((line + '\n').encode('utf-8'))
-                    self.waiting_for_ack = True
-                    self.log_signal.emit(f"--> SENT: {line}")
-                    self.ack_timer.start(self.ack_timeout_seconds * 1000)
-                    
-                    lines_sent = self.total_lines - len(self.lines_to_send)
-                    self.progress_signal.emit(lines_sent, self.total_lines)
+                    line = self.serial_port.readline().decode('utf-8').strip()
+                    if line:
+                        self.received.emit(line)
+                        if self.is_sending_file and 'ok' in line.lower():
+                            self.response_timer.stop()
+                            self.send_next_file_line()
+                except serial.SerialException:
+                    self.running = False
+                    self.disconnect()
+            time.sleep(0.01)
 
-                except Exception as e:
-                    self.finished_signal.emit(f"Error sending line: {e}")
-                    self.stop()
-            else:
-                # No more lines to send
-                self.finished_signal.emit("File transfer completed successfully.")
-                self.stop()
+    def send_command(self, command):
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.write((command + '\n').encode('utf-8'))
+            self.received.emit(f">>> {command}")
 
-    @pyqtSlot()
-    def receive_ack(self):
-        """Called by a signal from the main thread when an 'ok' is received."""
-        with self.lock:
-            if self.waiting_for_ack:
-                self.ack_timer.stop() # Stop the timeout for the acknowledged line
-                self.waiting_for_ack = False
-                self.log_signal.emit("<-- ACK Received (ok)")
-                
-                # Immediately try to send the next line
-                self.send_next_line()
+    def start_file_transfer(self, file_content):
+        self.file_content = [line for line in file_content if line.strip() and not line.strip().startswith(';')]
+        if not self.file_content:
+            self.file_transfer_complete.emit(True, "File is empty or contains only comments.")
+            return
+            
+        self.is_sending_file = True
+        self.file_line_index = 0
+        self.cancel_transfer = False
+        self.send_next_file_line()
 
-    def timeout_occurred(self):
-        """Handles the ACK timeout."""
-        with self.lock:
-            if self.waiting_for_ack:
-                self.finished_signal.emit(f"TIMEOUT: No 'ok' received for {self.ack_timeout_seconds} seconds. Transfer failed.")
-                self.stop()
+    def send_next_file_line(self):
+        if self.cancel_transfer:
+            self.is_sending_file = False
+            self.response_timer.stop()
+            self.file_transfer_complete.emit(False, "File transfer cancelled.")
+            return
 
-    def stop(self):
-        """Stops the transfer and its timer. Should only be called from the worker thread."""
-        with self.lock:
-            self._is_running = False
-            if self.ack_timer:
-                self.ack_timer.stop()
-    
-    @pyqtSlot()
-    def request_stop(self):
-        """A slot that can be called from the main thread to safely stop the worker."""
-        self.stop()
-        self.finished_signal.emit("File transfer cancelled by user.")
-
-
-# --- Custom QLineEdit with Command History ---
-class CommandHistoryLineEdit(QLineEdit):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.history = []
-        self.history_index = -1
-
-    def add_to_history(self, command):
-        """Adds a command to the history, avoiding duplicates."""
-        if command in self.history:
-            self.history.remove(command)
-        self.history.insert(0, command)
-        self.history_index = -1 # Reset index
-
-    def keyPressEvent(self, event: QKeyEvent):
-        """Handle up and down arrow keys for history navigation."""
-        if event.key() == Qt.Key.Key_Up:
-            if self.history_index < len(self.history) - 1:
-                self.history_index += 1
-                self.setText(self.history[self.history_index])
-        elif event.key() == Qt.Key.Key_Down:
-            if self.history_index > 0:
-                self.history_index -= 1
-                self.setText(self.history[self.history_index])
-            else:
-                self.history_index = -1
-                self.clear()
+        if self.file_line_index < len(self.file_content):
+            line = self.file_content[self.file_line_index]
+            self.send_command(line)
+            self.response_timer.start(60000) # 60 second timeout for 'ok'
+            self.file_transfer_progress.emit(self.file_line_index + 1)
+            self.file_line_index += 1
         else:
-            super().keyPressEvent(event)
+            self.is_sending_file = False
+            self.file_transfer_complete.emit(True, "File transfer complete.")
+
+    def stop_file_transfer(self):
+        self.cancel_transfer = True
+
+    def handle_timeout(self):
+        self.is_sending_file = False
+        self.file_transfer_complete.emit(False, "Transfer failed: No 'ok' received from device (60s timeout).")
 
 
-# --- Main Application Window ---
-class SerialConsoleApp(QMainWindow):
-    ack_received_signal = pyqtSignal()
-    request_stop_signal = pyqtSignal()
-
+class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()
+        super(MainWindow, self).__init__()
+        loadUi('main_window.ui', self)
+
+        self.command_history = []
+        self.history_index = -1
+        self.serial_worker = None
+        self.serial_thread = None
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.request_status)
         
-        # Load the UI from the .ui file
-        uic.loadUi('serial_console.ui', self)
+        self.gcode_lines = []
+        self.path_points = np.array([])
+        self.gcode_plot = None
+        self.progress_plot = None
 
-        # --- Replace the placeholder QLineEdit with our custom one ---
-        # This is a common pattern when using .ui files with custom widgets.
-        # 1. Get the properties and layout of the placeholder
-        original_command_input = self.command_input
-        layout = original_command_input.parent().layout()
-        
-        # 2. Create an instance of our custom widget
-        self.command_input = CommandHistoryLineEdit()
-        
-        # 3. Copy properties from the placeholder
-        self.command_input.setObjectName(original_command_input.objectName())
-        self.command_input.setPlaceholderText(original_command_input.placeholderText())
-        
-        # 4. Replace the placeholder in the layout
-        layout.replaceWidget(original_command_input, self.command_input)
-        original_command_input.deleteLater()
-
-
-        # --- Serial Port State ---
-        self.serial_port = serial.Serial()
-        self.is_connected = False
-        self.file_transfer_thread = None
-        self.file_sender_worker = None
-        self.is_polling_status = False
-        self.waiting_for_status_response = False
-        self.received_data_buffer = ""
-        self.is_laser_on = False
-
-        # --- Connect Signals to Slots ---
-        self.connect_button.clicked.connect(self.toggle_connection)
-        self.command_input.returnPressed.connect(self.send_command)
-        self.hard_reset_button.clicked.connect(self.hard_reset)
-        self.soft_reset_button.clicked.connect(self.soft_reset)
-        self.abort_button.clicked.connect(self.send_abort)
-        self.unlock_button.clicked.connect(self.send_unlock)
-        self.home_button.clicked.connect(self.send_home)
-        self.laser_toggle_button.clicked.connect(self.toggle_laser)
-        self.send_file_button.clicked.connect(self.send_file)
-        self.cancel_file_button.clicked.connect(self.cancel_file_transfer)
-        self.jog_up_button.clicked.connect(lambda: self.send_jog_command("Y"))
-        self.jog_down_button.clicked.connect(lambda: self.send_jog_command("Y-"))
-        self.jog_left_button.clicked.connect(lambda: self.send_jog_command("X-"))
-        self.jog_right_button.clicked.connect(lambda: self.send_jog_command("X"))
-        self.jog_z_up_button.clicked.connect(lambda: self.send_jog_command("Z"))
-        self.jog_z_down_button.clicked.connect(lambda: self.send_jog_command("Z-"))
-
-        # --- Initial UI State ---
+        self.setup_ui()
         self.populate_ports()
-        self.baud_selector.setCurrentText("115200")
-        self.update_ui_state()
+        self.populate_baudrates()
+        self.setup_3d_viewer()
 
-        # --- Timers ---
-        self.status_poll_timer = QTimer(self)
-        self.status_poll_timer.timeout.connect(self.poll_status)
+    def setup_ui(self):
+        # Connect signals and slots
+        self.connectButton.clicked.connect(self.toggle_connection)
+        self.refreshPortsButton.clicked.connect(self.populate_ports)
+        self.sendButton.clicked.connect(self.send_manual_command)
+        self.commandLineEdit.returnPressed.connect(self.send_manual_command)
+        self.commandLineEdit.installEventFilter(self)
         
-        # This timer will process serial data received by the pyserial thread
-        self.serial_read_timer = QTimer(self)
-        self.serial_read_timer.timeout.connect(self.read_serial_data)
-        self.serial_read_timer.start(20) # Check for new data every 20ms
+        self.loadFileButton.clicked.connect(self.load_file)
+        self.sendFileButton.clicked.connect(self.send_file)
+        self.cancelSendButton.clicked.connect(self.cancel_file_send)
+        
+        self.homeButton.clicked.connect(lambda: self.send_control_command("$H"))
+        self.unlockButton.clicked.connect(lambda: self.send_control_command("$X"))
+        self.softResetButton.clicked.connect(lambda: self.send_control_command("\x18"))
+        self.hardResetButton.clicked.connect(self.hard_reset)
+        self.abortButton.clicked.connect(lambda: self.send_control_command("\x85"))
+
+        self.laserToggleButton.clicked.connect(self.toggle_laser)
+        
+        # Jogging buttons
+        self.xPlusButton.clicked.connect(lambda: self.jog("X"))
+        self.xMinusButton.clicked.connect(lambda: self.jog("X", "-"))
+        self.yPlusButton.clicked.connect(lambda: self.jog("Y"))
+        self.yMinusButton.clicked.connect(lambda: self.jog("Y", "-"))
+        self.zUpButton.clicked.connect(lambda: self.jog("Z"))
+        self.zDownButton.clicked.connect(lambda: self.jog("Z", "-"))
+
+    def setup_3d_viewer(self):
+        self.viewer = gl.GLViewWidget()
+        self.viewer.opts['distance'] = 40
+        self.viewer_layout = QVBoxLayout(self.viewerFrame)
+        self.viewer_layout.addWidget(self.viewer)
+        
+        grid = gl.GLGridItem()
+        self.viewer.addItem(grid)
 
     def populate_ports(self):
-        """Fills the port selector with available serial ports."""
-        self.port_selector.clear()
+        self.portComboBox.clear()
         ports = serial.tools.list_ports.comports()
         for port in ports:
-            self.port_selector.addItem(port.device)
-        if sys.platform == "win32" and "COM3" in [p.device for p in ports]:
-            self.port_selector.setCurrentText("COM3")
+            self.portComboBox.addItem(port.device)
 
-    def update_ui_state(self):
-        """Enables/disables UI elements based on connection state."""
-        is_transferring = self.file_transfer_thread is not None and self.file_transfer_thread.isRunning()
-        
-        self.port_selector.setEnabled(not self.is_connected)
-        self.baud_selector.setEnabled(not self.is_connected)
-        
-        self.command_input.setEnabled(self.is_connected and not is_transferring)
-        self.hard_reset_button.setEnabled(self.is_connected and not is_transferring)
-        self.soft_reset_button.setEnabled(self.is_connected and not is_transferring)
-        self.abort_button.setEnabled(self.is_connected and not is_transferring)
-        self.unlock_button.setEnabled(self.is_connected and not is_transferring)
-        self.home_button.setEnabled(self.is_connected and not is_transferring)
-        self.laser_toggle_button.setEnabled(self.is_connected and not is_transferring)
-        self.laser_power_input.setEnabled(self.is_connected and not is_transferring)
-        self.send_file_button.setEnabled(self.is_connected and not is_transferring)
-        self.cancel_file_button.setEnabled(self.is_connected and is_transferring)
-        
-        # Jogging controls
-        self.jog_up_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_down_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_left_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_right_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_z_up_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_z_down_button.setEnabled(self.is_connected and not is_transferring)
-        self.jog_xy_dist_input.setEnabled(self.is_connected and not is_transferring)
-        self.jog_z_dist_input.setEnabled(self.is_connected and not is_transferring)
-        self.jog_feed_rate_input.setEnabled(self.is_connected and not is_transferring)
+    def populate_baudrates(self):
+        self.baudRateComboBox.addItems(['9600', '19200', '38400', '57600', '115200'])
+        self.baudRateComboBox.setCurrentText('115200')
 
     def toggle_connection(self):
-        """Connects or disconnects the serial port."""
-        if self.is_connected:
-            self.disconnect_serial()
-        else:
-            self.connect_serial()
-        self.update_ui_state()
+        if self.serial_worker is None:
+            port = self.portComboBox.currentText()
+            baudrate = int(self.baudRateComboBox.currentText())
+            if not port:
+                QMessageBox.warning(self, "Connection Error", "No serial port selected.")
+                return
 
-    def connect_serial(self):
-        """Establishes the serial connection."""
-        port = self.port_selector.currentText()
-        baud = int(self.baud_selector.currentText())
-        if not port:
-            self.log_to_console("Error: No serial port selected.")
-            return
-
-        try:
-            self.serial_port.port = port
-            self.serial_port.baudrate = baud
-            self.serial_port.timeout = 0.1 # Non-blocking read
-            self.serial_port.open()
-            self.is_connected = True
-            self.connect_button.setText("Disconnect")
-            self.log_to_console(f"Connected to {port} at {baud} baud.")
-            self.status_poll_timer.start(1000) # Start polling every second
-        except serial.SerialException as e:
-            self.log_to_console(f"Error connecting: {e}")
-            self.is_connected = False
-
-    def disconnect_serial(self):
-        """Closes the serial connection."""
-        # Safety feature: turn off laser on disconnect
-        if self.is_laser_on:
-            self.toggle_laser()
-
-        if self.file_transfer_thread and self.file_transfer_thread.isRunning():
-            self.cancel_file_transfer()
-        
-        self.status_poll_timer.stop()
-        if self.serial_port.is_open:
-            self.serial_port.close()
-        self.is_connected = False
-        self.connect_button.setText("Connect")
-        self.log_to_console("Disconnected.")
-        self.clear_status_display()
-
-    def read_serial_data(self):
-        """Reads data from serial and processes it."""
-        if self.serial_port and self.serial_port.is_open:
-            try:
-                # Read all available bytes
-                data_bytes = self.serial_port.read(self.serial_port.in_waiting or 1)
-                if not data_bytes:
-                    return
-
-                # Decode and add to buffer
-                self.received_data_buffer += data_bytes.decode('utf-8', errors='replace')
+            self.serial_worker = SerialWorker(port, baudrate)
+            if self.serial_worker.connect():
+                self.serial_thread = QThread()
+                self.serial_worker.moveToThread(self.serial_thread)
+                self.serial_thread.started.connect(self.serial_worker.read_from_port)
+                self.serial_worker.received.connect(self.update_console)
+                self.serial_worker.finished.connect(self.on_serial_disconnected)
+                self.serial_worker.file_transfer_progress.connect(self.update_file_progress)
+                self.serial_worker.file_transfer_complete.connect(self.on_file_transfer_complete)
+                self.serial_thread.start()
                 
-                # Process complete lines from the buffer
-                while '\n' in self.received_data_buffer:
-                    line, self.received_data_buffer = self.received_data_buffer.split('\n', 1)
-                    line = line.strip()
-                    if line:
-                        self.process_received_line(line)
+                self.connectButton.setText("Disconnect")
+                self.consoleOutput.append("<<< Connected")
+                self.status_timer.start(1000)
+            else:
+                QMessageBox.critical(self, "Connection Error", f"Failed to connect to {port}")
+                self.serial_worker = None
 
-            except serial.SerialException as e:
-                self.log_to_console(f"Serial error: {e}")
-                self.disconnect_serial()
-                self.update_ui_state()
-
-    def process_received_line(self, line):
-        """Handles a single, complete line of received data."""
-        is_transferring = self.file_transfer_thread is not None and self.file_transfer_thread.isRunning()
-        if is_transferring and line.lower() == 'ok':
-            if self.file_sender_worker:
-                self.ack_received_signal.emit()
-            return # Don't print "ok" to console during transfer
-
-        # Check if this is a status response
-        if self.waiting_for_status_response and line.startswith('<') and line.endswith('>'):
-            self.parse_and_display_status(line)
-            self.waiting_for_status_response = False
-            # Don't log status responses to the main console to keep it clean
-            return
-
-        # Otherwise, just log to the main console
-        self.log_to_console(f"<<< {line}")
-
-    def parse_and_display_status(self, line):
-        """Parses a FluidNC or Grbl status string and updates the UI."""
-        # Don't update from machine status if we are sending a file
-        is_transferring = self.file_transfer_thread is not None and self.file_transfer_thread.isRunning()
-        if is_transferring:
-            return
-
-        try:
-            # Default values
-            state = "Unknown"
-            x, y, z = "---", "---", "---"
-
-            # Extract state
-            state_match = re.match(r"<(\w+)", line)
-            if state_match:
-                state = state_match.group(1)
-
-            # Extract MPos or WPos
-            pos_match = re.search(r"(?:MPos|WPos):([-\d\.]+),([-\d\.]+),([-\d\.]+)", line)
-            if pos_match:
-                x = pos_match.group(1)
-                y = pos_match.group(2)
-                z = pos_match.group(3)
-
-            self.state_display.setText(state)
-            self.x_pos_display.setText(x)
-            self.y_pos_display.setText(y)
-            self.z_pos_display.setText(z)
-
-        except Exception as e:
-            # If parsing fails, show the raw line in the state field
-            self.state_display.setText(line)
-            self.x_pos_display.setText("Error")
-            self.y_pos_display.setText("Error")
-            self.z_pos_display.setText("Error")
-            self.log_to_console(f"Status parsing error: {e}")
-            
-    def clear_status_display(self):
-        """Clears the structured status display fields."""
-        self.state_display.clear()
-        self.x_pos_display.clear()
-        self.y_pos_display.clear()
-        self.z_pos_display.clear()
-
-    def log_to_console(self, message):
-        """Appends a message to the console output and scrolls to the bottom."""
-        self.console_output.append(message)
-        self.console_output.verticalScrollBar().setValue(self.console_output.verticalScrollBar().maximum())
-
-    def send_command(self):
-        """Sends a command from the input box."""
-        if self.is_connected:
-            command = self.command_input.text()
-            if command:
-                try:
-                    self.serial_port.write((command + '\n').encode('utf-8'))
-                    self.log_to_console(f">>> {command}")
-                    self.command_input.add_to_history(command)
-                    self.command_input.clear()
-                except serial.SerialException as e:
-                    self.log_to_console(f"Error writing to port: {e}")
-
-    # --- Control Button Actions ---
-    def hard_reset(self):
-        if self.is_connected:
-            try:
-                self.log_to_console("Performing hard reset (DTR toggle)...")
-                self.serial_port.setDTR(False)
-                time.sleep(0.5)
-                self.serial_port.setDTR(True)
-                self.log_to_console("Hard reset complete.")
-            except serial.SerialException as e:
-                self.log_to_console(f"DTR toggle failed: {e}")
-
-    def soft_reset(self):
-        if self.is_connected:
-            self.log_to_console("Sending soft reset (Ctrl+X)...")
-            self.serial_port.write(b'\x18')
-
-    def send_abort(self):
-        if self.is_connected:
-            self.log_to_console("Sending abort (0x85)...")
-            self.serial_port.write(b'\x85')
-            
-    def send_unlock(self):
-        if self.is_connected:
-            self.log_to_console("Sending unlock ($X)...")
-            self.serial_port.write(b'$X\n')
-            
-    def send_home(self):
-        if self.is_connected:
-            command = "$H"
-            self.serial_port.write(command.encode('utf-8') + b'\n')
-            self.log_to_console(f">>> {command} (Homing Cycle)")
-            
-    def toggle_laser(self):
-        """Toggles the laser on or off."""
-        if not self.is_connected:
-            return
-            
-        if self.is_laser_on:
-            # Turn laser off
-            command = "M5"
-            self.serial_port.write(command.encode('utf-8') + b'\n')
-            self.log_to_console(f">>> {command} (Laser Off)")
-            self.laser_toggle_button.setText("Laser On")
-            self.is_laser_on = False
         else:
-            # Turn laser on
-            power = self.laser_power_input.value()
-            command = f"M3 S{power}"
-            self.serial_port.write(command.encode('utf-8') + b'\n')
-            self.log_to_console(f">>> {command} (Laser On)")
-            self.laser_toggle_button.setText("Laser Off")
-            self.is_laser_on = True
+            if self.laserToggleButton.isChecked():
+                self.toggle_laser() # Turn off laser before disconnecting
+            self.status_timer.stop()
+            self.serial_worker.disconnect()
 
+    def on_serial_disconnected(self):
+        self.connectButton.setText("Connect")
+        self.consoleOutput.append("<<< Disconnected")
+        if self.serial_thread:
+            self.serial_thread.quit()
+            self.serial_thread.wait()
+        self.serial_worker = None
+        self.serial_thread = None
 
-    def poll_status(self):
-        """Sends '?' to poll device status."""
-        if self.is_connected and not self.waiting_for_status_response:
-            try:
-                self.serial_port.write(b'?')
-                self.waiting_for_status_response = True
-            except serial.SerialException as e:
-                self.log_to_console(f"Status poll failed: {e}")
+    def send_manual_command(self):
+        command = self.commandLineEdit.text()
+        if command and self.serial_worker:
+            self.serial_worker.send_command(command)
+            if not self.command_history or self.command_history[-1] != command:
+                 self.command_history.append(command)
+            self.history_index = len(self.command_history)
+            self.commandLineEdit.clear()
 
-    # --- File Transfer Actions ---
+    def eventFilter(self, source, event):
+        if source is self.commandLineEdit:
+            if event.type() == event.Type.KeyPress:
+                if event.key() == 16777235:  # Up arrow
+                    if self.history_index > 0:
+                        self.history_index -= 1
+                        self.commandLineEdit.setText(self.command_history[self.history_index])
+                    return True
+                elif event.key() == 16777237:  # Down arrow
+                    if self.history_index < len(self.command_history) -1:
+                        self.history_index += 1
+                        self.commandLineEdit.setText(self.command_history[self.history_index])
+                    else:
+                        self.history_index = len(self.command_history)
+                        self.commandLineEdit.clear()
+                    return True
+        return super().eventFilter(source, event)
+
+    @pyqtSlot(str)
+    def update_console(self, text):
+        self.consoleOutput.append(f"<<< {text}")
+        self.consoleOutput.verticalScrollBar().setValue(self.consoleOutput.verticalScrollBar().maximum())
+        self.parse_status(text)
+
+    def load_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Open G-code File", "", "G-code Files (*.gcode *.nc *.tap);;All Files (*)")
+        if file_name:
+            with open(file_name, 'r') as f:
+                self.gcode_lines = f.readlines()
+            self.parse_and_draw_gcode()
+            self.consoleOutput.append(f">>> Loaded file: {file_name}")
+            self.fileProgressBar.setValue(0)
+
     def send_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select File to Send")
-        if not file_path:
+        if not self.serial_worker:
+            QMessageBox.warning(self, "File Transfer", "Not connected to a device.")
             return
 
-        self.file_transfer_thread = QThread()
-        self.file_sender_worker = FileSenderWorker(
-            self.serial_port,
-            file_path
-        )
-        self.file_sender_worker.moveToThread(self.file_transfer_thread)
-
-        # Connect signals
-        self.file_sender_worker.progress_signal.connect(self.update_file_progress)
-        self.file_sender_worker.finished_signal.connect(self.file_transfer_finished)
-        self.file_sender_worker.log_signal.connect(self.log_to_console)
-        self.file_sender_worker.position_update_signal.connect(self.update_display_from_gcode)
-        self.file_transfer_thread.started.connect(self.file_sender_worker.run)
-        self.ack_received_signal.connect(self.file_sender_worker.receive_ack)
-        self.request_stop_signal.connect(self.file_sender_worker.request_stop)
-
-        self.file_transfer_thread.start()
-        self.status_poll_timer.stop() # Pause status polling during transfer
-        self.update_ui_state()
-        
-    @pyqtSlot(str, str, str)
-    def update_display_from_gcode(self, x, y, z):
-        """Updates the coordinate display based on the G-code parser."""
-        self.state_display.setText("Sending")
-        self.x_pos_display.setText(x)
-        self.y_pos_display.setText(y)
-        self.z_pos_display.setText(z)
-
-    def update_file_progress(self, sent, total):
-        self.file_progress_label.setText(f"Sending: {sent} / {total} lines")
-
-    def file_transfer_finished(self, message):
-        self.log_to_console(message)
-        self.file_progress_label.setText("File transfer idle.")
-        
-        if self.file_transfer_thread:
-            # Disconnect the signals to avoid issues on the next transfer
-            try:
-                self.ack_received_signal.disconnect(self.file_sender_worker.receive_ack)
-                self.file_sender_worker.position_update_signal.disconnect(self.update_display_from_gcode)
-                self.request_stop_signal.disconnect(self.file_sender_worker.request_stop)
-            except TypeError:
-                pass # Signal was already disconnected
-            self.file_transfer_thread.quit()
-            self.file_transfer_thread.wait()
-        
-        self.file_transfer_thread = None
-        self.file_sender_worker = None
-        
-        if self.is_connected:
-            self.status_poll_timer.start() # Resume polling
-        self.update_ui_state()
-
-    def cancel_file_transfer(self):
-        if self.file_sender_worker:
-            self.request_stop_signal.emit()
-
-    # --- Jogging Actions ---
-    def send_jog_command(self, axis_dir):
-        if not self.is_connected:
+        if not self.gcode_lines:
+            QMessageBox.warning(self, "File Transfer", "No file loaded. Please load a file first.")
             return
-        
-        axis = axis_dir[0]
-        
-        try:
-            if axis in ('X', 'Y'):
-                dist = float(self.jog_xy_dist_input.text())
-            else: # Z axis
-                dist = float(self.jog_z_dist_input.text())
+
+        self.serial_worker.start_file_transfer(self.gcode_lines)
+        self.status_timer.stop()
+        self.cancelSendButton.setEnabled(True)
+
+    def cancel_file_send(self):
+        if self.serial_worker and self.serial_worker.is_sending_file:
+            self.serial_worker.stop_file_transfer()
+            self.cancelSendButton.setEnabled(False)
+
+    def update_file_progress(self, line_num):
+        total_lines = len(self.serial_worker.file_content)
+        self.fileProgressBar.setValue(int((line_num / total_lines) * 100))
+        self.update_progress_plot(line_num)
+
+    def on_file_transfer_complete(self, success, message):
+        QMessageBox.information(self, "File Transfer", message)
+        self.fileProgressBar.setValue(100 if success else 0)
+        if not self.serial_worker.is_sending_file: # Check if another transfer has started
+            self.status_timer.start(1000)
+        self.cancelSendButton.setEnabled(False)
+
+    def send_control_command(self, command):
+        if self.serial_worker:
+            self.serial_worker.send_command(command)
+
+    def hard_reset(self):
+        if self.serial_worker and self.serial_worker.serial_port:
+            self.serial_worker.serial_port.dtr = not self.serial_worker.serial_port.dtr
+            time.sleep(0.1)
+            self.serial_worker.serial_port.dtr = not self.serial_worker.serial_port.dtr
+            self.consoleOutput.append(">>> Hard Reset (DTR toggled)")
+
+    def toggle_laser(self):
+        if self.serial_worker:
+            if self.laserToggleButton.isChecked():
+                power = self.laserPowerSpinBox.value()
+                self.send_control_command(f"M3 S{power}")
+                self.laserToggleButton.setText("Laser OFF")
+            else:
+                self.send_control_command("M5")
+                self.laserToggleButton.setText("Laser ON")
+
+    def request_status(self):
+        if self.serial_worker and not self.serial_worker.is_sending_file:
+            self.send_control_command("?")
+
+    def parse_status(self, status_string):
+        if status_string.startswith('<') and status_string.endswith('>'):
+            parts = status_string[1:-1].split('|')
+            self.stateLabel.setText(parts[0])
+            for part in parts[1:]:
+                if part.startswith("WPos:") or part.startswith("MPos:"):
+                    coords_part = part.split(':')[1]
+                    coords = coords_part.split(',')
+                    if len(coords) >= 3:
+                        self.xPosLabel.setText(coords[0])
+                        self.yPosLabel.setText(coords[1])
+                        self.zPosLabel.setText(coords[2])
+                    
+    def jog(self, axis, direction="+"):
+        if self.serial_worker:
+            dist_xy = self.xyDistanceSpinBox.value()
+            dist_z = self.zDistanceSpinBox.value()
+            feed = self.feedRateSpinBox.value()
             
-            feed_rate = int(self.jog_feed_rate_input.text())
-        except ValueError:
-            self.log_to_console("Invalid jog distance or feed rate.")
-            return
+            distance = dist_xy if axis in "XY" else dist_z
+            if direction == "-":
+                distance = -distance
+                
+            command = f"$J=G91 {axis}{distance} F{feed}"
+            self.send_control_command(command)
 
-        if len(axis_dir) > 1 and axis_dir[1] == '-':
-            dist = -dist
-        
-        # Use Grbl jogging syntax: $J=G91 X... F...
-        command = f"$J=G91 {axis}{dist:.4f} F{feed_rate}"
+    def _parse_gcode_to_points(self, gcode_lines):
+        """Helper function to parse G-code lines into a numpy array of 3D points."""
+        points = []
+        current_pos = np.array([0., 0., 0.])
+        points.append(current_pos.copy())
+        absolute_mode = True  # Default to G90 (absolute)
+        last_move_command = None # Track G0 or G1
+
+        for i, line in enumerate(gcode_lines):
+            clean_line = line.split(';')[0].strip().upper()
+            if not clean_line:
+                continue
+
+            try:
+                # Check for modal commands first
+                if re.search(r'\bG90\b', clean_line):
+                    absolute_mode = True
+                if re.search(r'\bG91\b', clean_line):
+                    absolute_mode = False
+                
+                g0_match = re.search(r'\bG0\b', clean_line)
+                g1_match = re.search(r'\bG1\b', clean_line)
+                if g0_match or g1_match:
+                    last_move_command = 'G0' if g0_match else 'G1'
+
+                # Check for axis coordinates
+                x_match = re.search(r'X([-\d.]+)', clean_line)
+                y_match = re.search(r'Y([-\d.]+)', clean_line)
+                z_match = re.search(r'Z([-\d.]+)', clean_line)
+
+                # If we have a move command and at least one axis, process the move
+                if last_move_command and any([x_match, y_match, z_match]):
+                    if absolute_mode:
+                        new_pos = current_pos.copy()
+                        if x_match: new_pos[0] = float(x_match.group(1))
+                        if y_match: new_pos[1] = float(y_match.group(1))
+                        if z_match: new_pos[2] = float(z_match.group(1))
+                    else:  # Relative mode
+                        move = np.array([0., 0., 0.])
+                        if x_match: move[0] = float(x_match.group(1))
+                        if y_match: move[1] = float(y_match.group(1))
+                        if z_match: move[2] = float(z_match.group(1))
+                        new_pos = current_pos + move
+                    
+                    if not np.array_equal(new_pos, current_pos):
+                        points.append(new_pos)
+                        current_pos = new_pos
+
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"Error parsing G-code on line {i + 1}:\n\n"
+                                 f"Line content: '{line.strip()}'\n\n"
+                                 f"Error: {e}")
+        return np.array(points)
+
+    def parse_and_draw_gcode(self):
+        if self.gcode_plot:
+            self.viewer.removeItem(self.gcode_plot)
+        if self.progress_plot:
+            self.viewer.removeItem(self.progress_plot)
+
         try:
-            self.serial_port.write((command + '\n').encode('utf-8'))
-            self.log_to_console(f">>> JOG: {command}")
-        except serial.SerialException as e:
-            self.log_to_console(f"Error sending jog command: {e}")
+            self.path_points = self._parse_gcode_to_points(self.gcode_lines)
+        except ValueError as e:
+            QMessageBox.critical(self, "G-code Parsing Error", str(e))
+            self.gcode_lines = []
+            self.path_points = np.array([])
+            return
+        
+        if len(self.path_points) > 1:
+            self.gcode_plot = gl.GLLinePlotItem(pos=self.path_points, color=(0.5, 0.5, 1, 1), width=2, antialias=True)
+            self.viewer.addItem(self.gcode_plot)
+        else:
+            self.gcode_plot = None
+
+    def update_progress_plot(self, sent_line_count):
+        if self.progress_plot:
+            self.viewer.removeItem(self.progress_plot)
+        
+        sent_lines = self.serial_worker.file_content[:sent_line_count]
+        
+        try:
+            progress_points = self._parse_gcode_to_points(sent_lines)
+            if len(progress_points) > 1:
+                self.progress_plot = gl.GLLinePlotItem(pos=progress_points, color=(1, 0, 0, 1), width=3, antialias=True)
+                self.viewer.addItem(self.progress_plot)
+        except ValueError:
+            # This should not happen if the initial parse was successful, but it's a safe fallback.
+            pass
 
     def closeEvent(self, event):
-        """Ensure clean shutdown."""
-        self.disconnect_serial()
+        if self.serial_worker:
+            self.toggle_connection()
         event.accept()
 
-
-# --- Application Entry Point ---
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = SerialConsoleApp()
-    window.show()
+    main_win = MainWindow()
+    main_win.show()
     sys.exit(app.exec())
