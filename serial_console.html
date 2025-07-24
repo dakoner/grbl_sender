@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web CNC Console</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        html, body {
+            font-family: 'Inter', sans-serif;
+            background-color: #111827; /* bg-gray-900 */
+            color: #d1d5db; /* text-gray-300 */
+        }
+        /* Custom scrollbar for the console */
+        #console-output::-webkit-scrollbar {
+            width: 8px;
+        }
+        #console-output::-webkit-scrollbar-track {
+            background: #1f2937; /* bg-gray-800 */
+        }
+        #console-output::-webkit-scrollbar-thumb {
+            background-color: #4b5563; /* bg-gray-600 */
+            border-radius: 4px;
+            border: 2px solid #1f2937; /* bg-gray-800 */
+        }
+        .btn {
+            @apply px-4 py-2 text-sm font-medium text-white bg-gray-700 border border-gray-600 rounded-md shadow-sm hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors;
+        }
+        .btn-primary {
+            @apply bg-indigo-600 hover:bg-indigo-700 border-transparent;
+        }
+        .btn-danger {
+            @apply bg-red-700 hover:bg-red-800 border-transparent;
+        }
+        .btn-success {
+            @apply bg-green-600 hover:bg-green-700 border-transparent;
+        }
+        .input-field {
+            @apply block w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm;
+        }
+        .jog-btn {
+            @apply w-12 h-12 flex items-center justify-center text-xl font-bold bg-gray-700 border border-gray-600 rounded-md hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-indigo-500 disabled:opacity-50;
+        }
+    </style>
+</head>
+<body class="h-full overflow-hidden">
+    <div class="flex flex-col h-screen">
+        <!-- Main Content -->
+        <main class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+            <!-- Left Panel: 3D Viewer -->
+            <div id="viewer-container" class="flex-1 relative bg-gray-900">
+                <!-- This div will hold the three.js canvas -->
+            </div>
+
+            <!-- Right Panel: Controls & Console -->
+            <aside class="w-full lg:w-96 xl:w-[450px] bg-gray-800 flex flex-col p-4 space-y-4 overflow-y-auto">
+                
+                <!-- Connection -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">Connection</h3>
+                    <div class="flex items-center space-x-2">
+                        <button id="connect-btn" class="btn btn-primary flex-1">Connect</button>
+                        <select id="baud-rate-select" class="input-field w-32">
+                            <option>9600</option>
+                            <option>38400</option>
+                            <option>57600</option>
+                            <option selected>115200</option>
+                            <option>230400</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Status -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">Status</h3>
+                    <div class="grid grid-cols-2 gap-2 text-sm">
+                        <div><strong>State:</strong> <span id="status-state" class="font-mono text-cyan-400">N/A</span></div>
+                        <div><strong>X:</strong> <span id="status-x" class="font-mono text-green-400">0.000</span></div>
+                        <div><strong>Y:</strong> <span id="status-y" class="font-mono text-green-400">0.000</span></div>
+                        <div><strong>Z:</strong> <span id="status-z" class="font-mono text-green-400">0.000</span></div>
+                    </div>
+                </div>
+
+                <!-- Machine Operations -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">Operations</h3>
+                    <div class="grid grid-cols-2 gap-2">
+                        <button id="home-btn" class="btn" disabled>Home ($H)</button>
+                        <button id="unlock-btn" class="btn" disabled>Unlock ($X)</button>
+                        <button id="soft-reset-btn" class="btn" disabled>Soft Reset</button>
+                        <button id="hard-reset-btn" class="btn" disabled>Hard Reset</button>
+                        <button id="abort-btn" class="btn btn-danger col-span-2" disabled>ABORT (0x85)</button>
+                    </div>
+                </div>
+
+                <!-- Jogging -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">Jogging</h3>
+                    <div class="flex justify-center items-center space-x-8">
+                        <div class="grid grid-cols-3 grid-rows-3 gap-1">
+                            <div class="col-start-2 row-start-1"><button id="jog-y-plus" class="jog-btn" disabled>Y+</button></div>
+                            <div class="col-start-1 row-start-2"><button id="jog-x-minus" class="jog-btn" disabled>X-</button></div>
+                            <div class="col-start-3 row-start-2"><button id="jog-x-plus" class="jog-btn" disabled>X+</button></div>
+                            <div class="col-start-2 row-start-3"><button id="jog-y-minus" class="jog-btn" disabled>Y-</button></div>
+                        </div>
+                        <div class="grid grid-cols-1 grid-rows-2 gap-1">
+                            <button id="jog-z-plus" class="jog-btn" disabled>Z+</button>
+                            <button id="jog-z-minus" class="jog-btn" disabled>Z-</button>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mt-4">
+                        <div>
+                            <label for="xy-dist" class="block text-xs font-medium text-gray-400">XY Dist (mm)</label>
+                            <input type="number" id="xy-dist" value="10" class="input-field mt-1">
+                        </div>
+                        <div>
+                            <label for="z-dist" class="block text-xs font-medium text-gray-400">Z Dist (mm)</label>
+                            <input type="number" id="z-dist" value="1" class="input-field mt-1">
+                        </div>
+                        <div class="col-span-2">
+                            <label for="feed-rate" class="block text-xs font-medium text-gray-400">Feed (mm/min)</label>
+                            <input type="number" id="feed-rate" value="1000" class="input-field mt-1">
+                        </div>
+                    </div>
+                </div>
+
+                 <!-- File Transfer -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">File Transfer</h3>
+                    <div class="space-y-2">
+                        <div class="grid grid-cols-2 gap-2">
+                            <button id="load-file-btn" class="btn" disabled>Load G-code File</button>
+                            <button id="send-file-btn" class="btn btn-success" disabled>Send Loaded File</button>
+                        </div>
+                        <input type="file" id="file-input" accept=".gcode,.nc,.txt" class="hidden">
+                        <div id="progress-container" class="hidden w-full bg-gray-700 rounded-full h-2.5">
+                            <div id="progress-bar" class="bg-blue-600 h-2.5 rounded-full" style="width: 0%"></div>
+                        </div>
+                        <div id="file-info" class="text-xs text-center text-gray-400 h-4"></div>
+                        <button id="cancel-btn" class="btn btn-danger w-full hidden">Cancel Transfer</button>
+                    </div>
+                </div>
+
+                <!-- Laser Control -->
+                <div class="p-4 bg-gray-900 rounded-lg">
+                    <h3 class="text-lg font-semibold mb-3 text-white">Laser Control</h3>
+                    <div class="flex items-center space-x-2">
+                        <button id="laser-toggle-btn" class="btn flex-1" disabled>Laser ON</button>
+                        <input type="number" id="laser-power-input" value="100" min="0" max="1023" class="input-field w-28" placeholder="S-Value">
+                    </div>
+                </div>
+
+                <!-- Console -->
+                <div class="flex-1 flex flex-col bg-gray-900 rounded-lg p-4 min-h-[200px]">
+                    <h3 class="text-lg font-semibold mb-2 text-white">Console</h3>
+                    <div id="console-output" class="flex-1 bg-black rounded-md p-2 text-xs font-mono overflow-y-auto whitespace-pre-wrap break-words"></div>
+                    <div class="mt-2 flex">
+                        <input type="text" id="command-input" class="input-field flex-1 rounded-r-none" placeholder="Enter G-code command...">
+                        <button id="send-command-btn" class="btn rounded-l-none" disabled>Send</button>
+                    </div>
+                </div>
+            </aside>
+        </main>
+        
+        <!-- Notification Area -->
+        <div id="notification" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 bg-indigo-600 text-white px-6 py-3 rounded-lg shadow-lg transition-opacity duration-300">
+            Notification message
+        </div>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- DOM Elements ---
+        const connectBtn = document.getElementById('connect-btn');
+        const baudRateSelect = document.getElementById('baud-rate-select');
+        const consoleOutput = document.getElementById('console-output');
+        const commandInput = document.getElementById('command-input');
+        const sendCommandBtn = document.getElementById('send-command-btn');
+        const loadFileBtn = document.getElementById('load-file-btn');
+        const sendFileBtn = document.getElementById('send-file-btn');
+        const fileInput = document.getElementById('file-input');
+        const cancelBtn = document.getElementById('cancel-btn');
+        const abortBtn = document.getElementById('abort-btn');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const fileInfo = document.getElementById('file-info');
+        const notification = document.getElementById('notification');
+        const allControlButtons = document.querySelectorAll('.btn, .jog-btn, .input-field');
+        const viewerContainer = document.getElementById('viewer-container');
+        
+        // --- State Variables ---
+        let port;
+        let reader;
+        let writer;
+        let isConnected = false;
+        let isSendingFile = false;
+        let cancelFileTransfer = false;
+        let isLaserOn = false;
+        let commandHistory = [];
+        let historyIndex = -1;
+        let statusInterval;
+        let gcodeLines = [];
+        let toolpathObject;
+        let gcodeLineToSegmentMap = [];
+
+
+        // --- 3D Viewer Setup ---
+        let scene, camera, renderer, controls;
+
+        function init3DViewer() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x111827);
+
+            const width = viewerContainer.clientWidth;
+            const height = viewerContainer.clientHeight;
+
+            camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+            camera.position.set(50, 50, 50);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(width, height);
+            viewerContainer.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.1;
+            controls.rotateSpeed = 0.5;
+            controls.mouseButtons = {
+                LEFT: THREE.MOUSE.ROTATE,
+                MIDDLE: THREE.MOUSE.DOLLY,
+                RIGHT: THREE.MOUSE.PAN
+            };
+            
+            const gridHelper = new THREE.GridHelper(200, 20, 0x444444, 0x444444);
+            scene.add(gridHelper);
+
+            const axesHelper = new THREE.AxesHelper(25);
+            scene.add(axesHelper);
+
+            window.addEventListener('resize', onWindowResize, false);
+            animate();
+        }
+
+        function onWindowResize() {
+            const width = viewerContainer.clientWidth;
+            const height = viewerContainer.clientHeight;
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            renderer.setSize(width, height);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // --- Serial Communication ---
+        async function connect() {
+            if (isConnected) {
+                await disconnect();
+                return;
+            }
+
+            try {
+                port = await navigator.serial.requestPort();
+                const baudRate = parseInt(baudRateSelect.value, 10);
+                await port.open({ baudRate });
+
+                isConnected = true;
+                connectBtn.textContent = 'Disconnect';
+                connectBtn.classList.remove('btn-primary');
+                connectBtn.classList.add('btn-danger');
+                
+                logToConsole('Serial port connected.', 'system');
+                showNotification('Connected successfully!');
+
+                const textDecoder = new TextDecoderStream();
+                port.readable.pipeTo(textDecoder.writable);
+                reader = textDecoder.readable.getReader();
+
+                const textEncoder = new TextEncoderStream();
+                textEncoder.readable.pipeTo(port.writable);
+                writer = textEncoder.writable.getWriter();
+                
+                updateControlState(true);
+                readLoop();
+                
+                statusInterval = setInterval(() => {
+                    if (isConnected && !isSendingFile) {
+                        writeToStream('?');
+                    }
+                }, 1000);
+
+            } catch (error) {
+                logToConsole(`Error: ${error.message}`, 'error');
+                showNotification(`Connection failed: ${error.message}`, true);
+            }
+        }
+
+        async function disconnect() {
+            if (!isConnected) return;
+            
+            if (isLaserOn) {
+                await writeToStream('M5\n');
+                logToConsole('Safety Off: Laser turned off due to disconnect.', 'system');
+                isLaserOn = false;
+                document.getElementById('laser-toggle-btn').textContent = 'Laser ON';
+                document.getElementById('laser-toggle-btn').classList.remove('btn-danger');
+            }
+
+            clearInterval(statusInterval);
+            cancelFileTransfer = true;
+
+            if (reader) {
+                await reader.cancel().catch(() => {});
+                reader.releaseLock();
+            }
+            if (writer) {
+                await writer.close().catch(() => {});
+                writer.releaseLock();
+            }
+            if (port) {
+                await port.close().catch(() => {});
+            }
+
+            port = null;
+            isConnected = false;
+            connectBtn.textContent = 'Connect';
+            connectBtn.classList.add('btn-primary');
+            connectBtn.classList.remove('btn-danger');
+            logToConsole('Serial port disconnected.', 'system');
+            showNotification('Disconnected.');
+            updateControlState(false);
+            resetStatusDisplay();
+        }
+
+        async function readLoop() {
+            let buffer = '';
+            while (port && port.readable) {
+                try {
+                    const { value, done } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    buffer += value;
+                    let newlineIndex;
+                    while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                        const line = buffer.slice(0, newlineIndex).trim();
+                        buffer = buffer.slice(newlineIndex + 1);
+                        if (line) {
+                            handleReceivedLine(line);
+                        }
+                    }
+                } catch (error) {
+                    logToConsole(`Read error: ${error.message}`, 'error');
+                    if(isConnected) await disconnect();
+                    break;
+                }
+            }
+        }
+
+        let okPromiseResolve = null;
+        function handleReceivedLine(line) {
+            logToConsole(`<<< ${line}`, 'received');
+            
+            if (line.toLowerCase().startsWith('ok') && okPromiseResolve) {
+                okPromiseResolve();
+                okPromiseResolve = null;
+            } else if (line.startsWith('<')) {
+                parseStatus(line);
+            }
+        }
+
+        async function writeToStream(data, log = true) {
+            if (!isConnected || !writer) return;
+            try {
+                if (log) logToConsole(`>>> ${data.replace('\n', '')}`, 'sent');
+                await writer.write(data);
+            } catch (error) {
+                logToConsole(`Write error: ${error.message}`, 'error');
+                await disconnect();
+            }
+        }
+
+        // --- G-Code Parsing and 3D Rendering ---
+        function parseGcodeForViewer(gcode) {
+            if (toolpathObject) {
+                scene.remove(toolpathObject);
+                toolpathObject.geometry.dispose();
+                toolpathObject.material.dispose();
+            }
+            gcodeLineToSegmentMap = [];
+
+            const lines = gcode.split('\n');
+            const vertices = [];
+            let lastPos = { x: 0, y: 0, z: 0 };
+            let currentLineNumber = 0;
+            
+            // --- Modal State ---
+            let isAbsolute = true; // G90 is the default
+            let motionMode = null; // Track G0/G1 state across lines
+
+            lines.forEach(line => {
+                line = line.trim().toUpperCase();
+                
+                // --- Update Modal State from current line ---
+                if (line.includes('G90')) isAbsolute = true;
+                if (line.includes('G91')) isAbsolute = false;
+                
+                // Find G0/G1/G00/G01 commands and update the motion mode
+                const gcodeMatch = line.match(/\b(G0|G1|G00|G01)\b/);
+                if (gcodeMatch) {
+                    // Normalize to G0 or G1
+                    motionMode = (gcodeMatch[0] === 'G0' || gcodeMatch[0] === 'G00') ? 'G0' : 'G1';
+                }
+
+                // --- Check for Movement ---
+                const xMatch = line.match(/X([-\d.]+)/);
+                const yMatch = line.match(/Y([-\d.]+)/);
+                const zMatch = line.match(/Z([-\d.]+)/);
+
+                // A move happens if a motion mode is active AND at least one axis is specified on the line
+                if (motionMode && (xMatch || yMatch || zMatch)) {
+                    const newPos = { ...lastPos };
+
+                    if (isAbsolute) {
+                        // In absolute mode, a missing coordinate keeps its old value (modal)
+                        if (xMatch) newPos.x = parseFloat(xMatch[1]);
+                        if (yMatch) newPos.y = parseFloat(yMatch[1]);
+                        if (zMatch) newPos.z = parseFloat(zMatch[1]);
+                    } else { // Incremental mode
+                        // In incremental mode, a missing coordinate means a move of 0 for that axis
+                        if (xMatch) newPos.x += parseFloat(xMatch[1]);
+                        if (yMatch) newPos.y += parseFloat(yMatch[1]);
+                        if (zMatch) newPos.z += parseFloat(zMatch[1]);
+                    }
+
+                    // Only add a line segment if the position actually changed
+                    if (newPos.x !== lastPos.x || newPos.y !== lastPos.y || newPos.z !== lastPos.z) {
+                        vertices.push(lastPos.x, lastPos.y, lastPos.z);
+                        vertices.push(newPos.x, newPos.y, newPos.z);
+                        
+                        gcodeLineToSegmentMap.push({
+                            lineNumber: currentLineNumber,
+                            vertexIndex: (vertices.length / 3) - 2
+                        });
+                    }
+                    
+                    lastPos = newPos;
+                }
+
+                currentLineNumber++;
+            });
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            
+            const colors = [];
+            const unexecutedColor = new THREE.Color(0x0077ff);
+            for (let i = 0; i < vertices.length / 3; i++) {
+                colors.push(unexecutedColor.r, unexecutedColor.g, unexecutedColor.b);
+            }
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+            const material = new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 2 });
+            toolpathObject = new THREE.LineSegments(geometry, material);
+            scene.add(toolpathObject);
+            
+            const boundingBox = new THREE.Box3().setFromObject(toolpathObject);
+            const center = new THREE.Vector3();
+            boundingBox.getCenter(center);
+            const size = new THREE.Vector3();
+            boundingBox.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ = Math.max(cameraZ, size.z) * 1.5; // Ensure camera is far enough away
+            if (isNaN(cameraZ) || !isFinite(cameraZ)) cameraZ = 100;
+
+            controls.target.copy(center);
+            camera.position.set(center.x, center.y, center.z + cameraZ);
+            controls.update();
+        }
+
+        function highlightSegment(gcodeLineIndex) {
+            if (!toolpathObject) return;
+            
+            const segmentInfo = gcodeLineToSegmentMap.find(s => s.lineNumber === gcodeLineIndex);
+            if (!segmentInfo) return;
+
+            const colorAttribute = toolpathObject.geometry.attributes.color;
+            const executedColor = new THREE.Color(0x00ff00);
+            
+            colorAttribute.setXYZ(segmentInfo.vertexIndex, executedColor.r, executedColor.g, executedColor.b);
+            colorAttribute.setXYZ(segmentInfo.vertexIndex + 1, executedColor.r, executedColor.g, executedColor.b);
+            colorAttribute.needsUpdate = true;
+        }
+
+
+        // --- File Handling ---
+        function handleFileLoad(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const content = e.target.result;
+                gcodeLines = content.split('\n')
+                    .map(line => line.trim())
+                    .filter(line => line.length > 0 && !line.startsWith(';'));
+                
+                fileInfo.textContent = `${file.name} (${gcodeLines.length} commands)`;
+                parseGcodeForViewer(content);
+                sendFileBtn.disabled = false;
+                showNotification('File loaded and rendered.');
+            };
+            reader.readAsText(file);
+            fileInput.value = ''; // Allow reloading the same file
+        }
+        
+        async function sendFile() {
+            if (!isConnected || isSendingFile || gcodeLines.length === 0) return;
+
+            isSendingFile = true;
+            cancelFileTransfer = false;
+            updateSendingState(true);
+            
+            let linesSent = 0;
+            for (const [index, line] of gcodeLines.entries()) {
+                if (cancelFileTransfer) {
+                    logToConsole('File transfer cancelled by user.', 'system');
+                    showNotification('File transfer cancelled.', true);
+                    break;
+                }
+                
+                try {
+                    await sendLineAndWaitForOk(line);
+                    linesSent++;
+                    highlightSegment(index);
+                    const progress = (linesSent / gcodeLines.length) * 100;
+                    progressBar.style.width = `${progress}%`;
+                    fileInfo.textContent = `Sending... ${linesSent}/${gcodeLines.length}`;
+                } catch (error) {
+                    logToConsole(`Error sending line ${index + 1}: ${line}. ${error.message}`, 'error');
+                    showNotification(`Transfer failed: ${error.message}`, true);
+                    break;
+                }
+            }
+            
+            if (!cancelFileTransfer) {
+                logToConsole('File transfer complete.', 'system');
+                showNotification('File transfer complete!');
+            }
+            
+            isSendingFile = false;
+            updateSendingState(false);
+            // Keep gcodeLines so user can re-send
+        }
+
+        function sendLineAndWaitForOk(line) {
+            return new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    okPromiseResolve = null;
+                    reject(new Error('Timeout waiting for "ok"'));
+                }, 60000);
+
+                okPromiseResolve = () => {
+                    clearTimeout(timeoutId);
+                    resolve();
+                };
+                
+                writeToStream(line + '\n');
+            });
+        }
+
+        function cancelFile() {
+            cancelFileTransfer = true;
+        }
+
+        // --- UI and State Management ---
+        function updateControlState(enabled) {
+            allControlButtons.forEach(btn => {
+                if(btn.id !== 'connect-btn' && btn.id !== 'baud-rate-select') {
+                    btn.disabled = !enabled;
+                }
+            });
+            if (!enabled) {
+                gcodeLines = [];
+                fileInfo.textContent = '';
+                updateSendingState(false);
+                document.querySelectorAll('.jog-btn').forEach(b => b.disabled = true);
+            }
+        }
+
+        function updateSendingState(isSending) {
+            loadFileBtn.disabled = isSending;
+            sendFileBtn.disabled = isSending || gcodeLines.length === 0;
+            cancelBtn.classList.toggle('hidden', !isSending);
+            progressContainer.classList.toggle('hidden', !isSending);
+
+            if (!isSending) {
+                 progressBar.style.width = '0%';
+                 if (gcodeLines.length > 0) {
+                     fileInfo.textContent = `${gcodeLines.length} commands loaded.`;
+                 }
+            }
+        }
+        
+        function logToConsole(message, type = 'info') {
+            const el = document.createElement('div');
+            el.textContent = message;
+            switch (type) {
+                case 'sent': el.className = 'text-yellow-400'; break;
+                case 'received': el.className = 'text-green-400'; break;
+                case 'error': el.className = 'text-red-500 font-bold'; break;
+                case 'system': el.className = 'text-cyan-400 italic'; break;
+            }
+            consoleOutput.appendChild(el);
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+        }
+
+        function showNotification(message, isError = false) {
+            notification.textContent = message;
+            notification.classList.remove('hidden', 'bg-indigo-600', 'bg-red-600');
+            notification.classList.add(isError ? 'bg-red-600' : 'bg-indigo-600');
+            setTimeout(() => {
+                notification.classList.add('hidden');
+            }, 3000);
+        }
+
+        function parseStatus(statusString) {
+            const statusRegex = /<(\w+).*?(?:W|M)Pos:([-\d.]+),([-\d.]+),([-\d.]+)/;
+            const match = statusString.match(statusRegex);
+
+            if (match) {
+                document.getElementById('status-state').textContent = match[1];
+                document.getElementById('status-x').textContent = parseFloat(match[2]).toFixed(3);
+                document.getElementById('status-y').textContent = parseFloat(match[3]).toFixed(3);
+                document.getElementById('status-z').textContent = parseFloat(match[4]).toFixed(3);
+            }
+        }
+        
+        function resetStatusDisplay() {
+            document.getElementById('status-state').textContent = 'N/A';
+            document.getElementById('status-x').textContent = '0.000';
+            document.getElementById('status-y').textContent = '0.000';
+            document.getElementById('status-z').textContent = '0.000';
+        }
+
+        // --- Command Handlers ---
+        function sendManualCommand() {
+            const command = commandInput.value.trim();
+            if (command) {
+                writeToStream(command + '\n');
+                if (commandHistory[commandHistory.length - 1] !== command) {
+                    commandHistory.push(command);
+                }
+                historyIndex = commandHistory.length;
+                commandInput.value = '';
+            }
+        }
+
+        function handleCommandInputKey(e) {
+            if (e.key === 'Enter') sendManualCommand();
+            else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (historyIndex > 0) {
+                    historyIndex--;
+                    commandInput.value = commandHistory[historyIndex];
+                }
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (historyIndex < commandHistory.length - 1) {
+                    historyIndex++;
+                    commandInput.value = commandHistory[historyIndex];
+                } else {
+                    historyIndex = commandHistory.length;
+                    commandInput.value = '';
+                }
+            }
+        }
+        
+        function sendJogCommand(axis, distance) {
+            const feed = document.getElementById('feed-rate').value;
+            const command = `$J=G91 ${axis}${distance} F${feed}`;
+            writeToStream(command + '\n');
+        }
+
+        // --- Event Listeners ---
+        connectBtn.addEventListener('click', connect);
+        sendCommandBtn.addEventListener('click', sendManualCommand);
+        commandInput.addEventListener('keydown', handleCommandInputKey);
+        
+        loadFileBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', handleFileLoad);
+        sendFileBtn.addEventListener('click', sendFile);
+        cancelBtn.addEventListener('click', cancelFile);
+
+        // Machine Operations
+        document.getElementById('home-btn').addEventListener('click', () => writeToStream('$H\n'));
+        document.getElementById('unlock-btn').addEventListener('click', () => writeToStream('$X\n'));
+        document.getElementById('soft-reset-btn').addEventListener('click', () => writeToStream('\x18'));
+        document.getElementById('hard-reset-btn').addEventListener('click', async () => {
+            if (port) {
+                logToConsole('Toggling DTR for hard reset.', 'system');
+                await port.setSignals({ dataTerminalReady: false });
+                await new Promise(resolve => setTimeout(resolve, 100));
+                await port.setSignals({ dataTerminalReady: true });
+            }
+        });
+        abortBtn.addEventListener('click', () => writeToStream('\x85'));
+
+        // Jogging
+        document.getElementById('jog-x-plus').addEventListener('click', () => sendJogCommand('X', document.getElementById('xy-dist').value));
+        document.getElementById('jog-x-minus').addEventListener('click', () => sendJogCommand('X', -document.getElementById('xy-dist').value));
+        document.getElementById('jog-y-plus').addEventListener('click', () => sendJogCommand('Y', document.getElementById('xy-dist').value));
+        document.getElementById('jog-y-minus').addEventListener('click', () => sendJogCommand('Y', -document.getElementById('xy-dist').value));
+        document.getElementById('jog-z-plus').addEventListener('click', () => sendJogCommand('Z', document.getElementById('z-dist').value));
+        document.getElementById('jog-z-minus').addEventListener('click', () => sendJogCommand('Z', -document.getElementById('z-dist').value));
+
+        // Laser Control
+        document.getElementById('laser-toggle-btn').addEventListener('click', () => {
+            const power = document.getElementById('laser-power-input').value;
+            if (isLaserOn) {
+                writeToStream('M5\n');
+                isLaserOn = false;
+                document.getElementById('laser-toggle-btn').textContent = 'Laser ON';
+                document.getElementById('laser-toggle-btn').classList.remove('btn-danger');
+            } else {
+                writeToStream(`M3 S${power}\n`);
+                isLaserOn = true;
+                document.getElementById('laser-toggle-btn').textContent = 'Laser OFF';
+                document.getElementById('laser-toggle-btn').classList.add('btn-danger');
+            }
+        });
+
+        // --- Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            if (!('serial' in navigator)) {
+                showNotification('Web Serial API not supported. Please use Chrome, Edge, or Opera.', true);
+                connectBtn.disabled = true;
+                connectBtn.textContent = 'Not Supported';
+            }
+            init3DViewer();
+            updateControlState(false);
+            resetStatusDisplay();
+        });
+
+    </script>
+</body>
+</html>
